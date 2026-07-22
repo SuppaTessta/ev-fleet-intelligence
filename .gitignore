@@ -1,0 +1,22 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Data (reproducible via data/download_*.sh scripts, not committed)
+data/raw/
+data/processed/
+
+# Trained model artifacts (reproducible via train/ scripts)
+backend/models/*.pkl
+backend/models/*.h5
+backend/models/*.keras
+
+# OS / editor
+.DS_Store
+.vscode/
+*.log
+
+# Env
+.env
