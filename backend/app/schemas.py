@@ -45,6 +45,29 @@ class BatteryRULResponse(BaseModel):
     business_impact: BatteryBusinessImpact | None = None
 
 
+class LiveTelemetryReading(BaseModel):
+    asset_id: str
+    depot: str
+    battery_id: str
+    cycle_number: int
+    total_cycles_recorded: int
+    historical_data_exhausted: bool
+    timestamp: str
+    voltage_v: float
+    current_a: float
+    temp_battery_c: float
+    predicted_rul_cycles: float
+    state_of_health_pct: float
+    current_capacity_ah: float
+    eol_threshold_ah: float
+    risk_band: str
+    business_impact: BatteryBusinessImpact | None = None
+
+
+class LiveFleetStatusResponse(BaseModel):
+    readings: list[LiveTelemetryReading]
+
+
 class QualityInspectionResponse(BaseModel):
     verdict: str
     confidence: float

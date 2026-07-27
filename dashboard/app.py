@@ -8,6 +8,7 @@ Run:  streamlit run dashboard/app.py   (from the project root)
 """
 
 import base64
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -113,9 +114,9 @@ def call_battery_agent(asset_id, capacity_history, current_cycle_number=None,
 st.sidebar.title("🔋 EV Fleet Intelligence")
 st.sidebar.caption("ET AI Hackathon 2.0 — Problem Statement #3")
 section = st.sidebar.radio("Navigate", [
-    "Fleet Command Center", "Fleet Overview", "Battery Deep-Dive", "Quality Inspection",
-    "Supply Chain Risk", "Electrification Readiness", "Net Zero Carbon Tracker",
-    "Maintenance Optimiser",
+    "Fleet Command Center", "Fleet Overview", "Battery Deep-Dive", "Live Fleet Monitor",
+    "Quality Inspection", "Supply Chain Risk", "Electrification Readiness",
+    "Net Zero Carbon Tracker", "Maintenance Optimiser",
 ])
 st.sidebar.divider()
 if api_alive():
@@ -252,6 +253,65 @@ elif section == "Battery Deep-Dive":
     st.subheader("Recent capacity trend")
     st.line_chart(pd.Series(asset["capacity_history"], name="Capacity (Ah)"))
     st.caption("Real NASA PCoE cycling data, most recent 10 discharge cycles shown.")
+
+# ---------------------------------------------------------------- Live Fleet Monitor
+elif section == "Live Fleet Monitor":
+    st.title("Live Fleet Monitor")
+    st.caption(
+        "Simulated live BMS telemetry — addresses the platform's IoT/Telematics/BMS Data Integration "
+        "gap. Each truck's reading below is a REAL NASA PCoE discharge cycle for that truck's battery, "
+        "replayed one cycle per refresh — not fabricated sensor noise. Once a truck's real recorded "
+        "history runs out it holds at its last real reading and says so, rather than looping."
+    )
+
+    if not api_alive():
+        st.warning("Start the backend (see sidebar) to start the live feed.")
+        st.stop()
+
+    if st.button("Reset simulation to start"):
+        requests.post(f"{API_BASE}/battery/live-fleet-reset", timeout=10)
+        st.session_state.pop("live_rul_history", None)
+        st.rerun()
+
+    @st.fragment(run_every="3s")
+    def live_fleet_fragment():
+        resp = requests.get(f"{API_BASE}/battery/live-fleet-status", timeout=10)
+        resp.raise_for_status()
+        df = pd.DataFrame(resp.json()["readings"])
+
+        st.caption(f"Last refreshed {datetime.now().strftime('%H:%M:%S')} — auto-updates every 3s")
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Trucks live", len(df))
+        c2.metric("Critical now", int((df.risk_band == "critical").sum()))
+        c3.metric("Avg SOH", f"{df.state_of_health_pct.mean():.1f}%")
+        c4.metric("Fully replayed", int(df.historical_data_exhausted.sum()))
+
+        st.divider()
+        for _, r in df.sort_values("predicted_rul_cycles").iterrows():
+            with st.container(border=True):
+                cols = st.columns([1.6, 1.7, 1.2, 1.1, 1.4, 1.4])
+                cols[0].markdown(f"**{r.asset_id}**  \n{r.depot}")
+                replay_note = " 🔁 replay exhausted" if r.historical_data_exhausted else ""
+                cols[1].markdown(f"Cycle {r.cycle_number}/{r.total_cycles_recorded}{replay_note}")
+                cols[2].markdown(f"{r.voltage_v} V  \n{r.current_a} A")
+                cols[3].markdown(f"{r.temp_battery_c} °C")
+                cols[4].markdown(f"RUL: **{r.predicted_rul_cycles:.0f}**  \nSOH: {r.state_of_health_pct}%")
+                cols[5].markdown(risk_pill(r.risk_band), unsafe_allow_html=True)
+
+        rul_history = st.session_state.setdefault("live_rul_history", {})
+        for _, r in df.iterrows():
+            rul_history.setdefault(r.asset_id, []).append(r.predicted_rul_cycles)
+            rul_history[r.asset_id] = rul_history[r.asset_id][-50:]  # cap so a long session can't grow unbounded
+
+        st.divider()
+        chosen = st.selectbox("Live RUL trend for", sorted(rul_history.keys()), key="live_trend_asset")
+        if chosen and len(rul_history[chosen]) > 1:
+            st.line_chart(pd.Series(rul_history[chosen], name="Predicted RUL (cycles), this session"))
+        else:
+            st.caption("Trend builds up as more refreshes come in this session.")
+
+    live_fleet_fragment()
 
 # ---------------------------------------------------------------- Quality Inspection
 elif section == "Quality Inspection":

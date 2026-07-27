@@ -1,0 +1,5 @@
+# Dev/test-only dependencies -- not needed to run the platform itself.
+# Install with: pip install -r backend/requirements-dev.txt
+# (after installing backend/requirements.txt as usual)
+pytest>=8.0
+httpx>=0.27

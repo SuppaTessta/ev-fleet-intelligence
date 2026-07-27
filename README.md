@@ -156,6 +156,21 @@ cd backend && uvicorn app.main:app --reload --port 8000
 # Interactive docs: http://localhost:8000/docs
 ```
 
+## Testing
+
+```bash
+pip install -r backend/requirements-dev.txt
+pytest tests/ -v
+```
+
+4 agents (Maintenance, Carbon, Fleet Readiness, plus every endpoint's request
+validation) are pure logic with no trained artifact, so those tests always
+pass on a fresh clone. The other 5 test files need trained models and/or
+processed data that are gitignored by design (reproducible via `train/*.py`
+and `data/*.py`, not committed) — those auto-skip with a clear reason instead
+of failing until you've run the relevant training step locally. Runs on every
+push via GitHub Actions (`.github/workflows/tests.yml`).
+
 ## Status
 
 All 7 agents are built, integrated behind one FastAPI backend, and live in

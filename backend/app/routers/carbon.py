@@ -1,4 +1,4 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from app.schemas import CarbonRequest, CarbonResponse
 from app.agents.carbon_agent import compute_savings, GRID_EMISSION_FACTOR_TREND, VEHICLE_ENERGY_PROFILES
 
@@ -7,7 +7,10 @@ router = APIRouter(prefix="/carbon", tags=["Net Zero Carbon Tracker"])
 
 @router.post("/compute-savings", response_model=CarbonResponse)
 def carbon_savings(req: CarbonRequest):
-    result = compute_savings(req.vehicle_model, req.daily_distance_km)
+    try:
+        result = compute_savings(req.vehicle_model, req.daily_distance_km)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     return CarbonResponse(**result)
 
 
