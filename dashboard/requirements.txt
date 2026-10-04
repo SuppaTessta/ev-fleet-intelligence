@@ -1,0 +1,13 @@
+# The dashboard ships as its own image and needs none of TensorFlow, LightGBM
+# or scikit-learn -- it talks to the API over HTTP. Kept as a file rather than
+# inline pip arguments in Dockerfile.dashboard so the versions live in one place
+# and Docker can cache the layer on it.
+
+# Floor is the oldest release this was actually run against, not the oldest
+# that might work: the layout argument is `width="stretch"`, and the
+# `use_container_width` it replaces was already past its stated removal date
+# (2025-12-31). Pinning below this would ship a kwarg we never exercised.
+streamlit>=1.62,<2.0
+altair>=5.0,<7.0
+pandas>=2.2,<4.0
+requests>=2.32,<3.0

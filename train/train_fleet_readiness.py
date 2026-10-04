@@ -12,69 +12,24 @@ Catalog is 3 real Indian commercial EVs (Mahindra Treo Zor, Euler HiLoad EV,
 Tata Ace EV) with real specs, not invented ones.
 """
 
+import sys
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
+# The scoring engine lives in the backend, which is the thing that has to work
+# in production. This script is dev tooling and imports FROM it -- the arrow used
+# to point the other way, with the serving module inserting the project root into
+# sys.path so it could reach into train/.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
+from app.agents.fleet_readiness_agent import (  # noqa: E402
+    EV_CATALOG,
+    ROUTE_TYPES,
+    score_vehicle,
+)
+
 RNG = np.random.default_rng(7)
-
-EV_CATALOG = [
-    {"model": "Mahindra Treo Zor", "category": "Light 3-wheeler cargo",
-     "range_km": 80, "payload_kg": 550, "price_inr_lakh": 3.3, "charge_time_hours": 5.0},
-    {"model": "Euler HiLoad EV", "category": "Medium 3-wheeler cargo",
-     "range_km": 135, "payload_kg": 688, "price_inr_lakh": 4.2, "charge_time_hours": 5.0},
-    {"model": "Tata Ace EV", "category": "Mini-truck (4-wheeler)",
-     "range_km": 154, "payload_kg": 600, "price_inr_lakh": 10.51, "charge_time_hours": 1.75},
-]
-RANGE_SAFETY_MARGIN = 1.25  # required range = daily distance x this, to cover traffic/weather/battery aging
-
-ROUTE_TYPES = ["Urban short-haul", "Urban long-haul", "Mixed depot-to-depot", "Highway feeder"]
-
-
-def score_vehicle(daily_distance_km: float, avg_payload_kg: float, dwell_time_hours: float) -> dict:
-    """The expert baseline: transparent, inspectable, unit-based gates."""
-    required_range = daily_distance_km * RANGE_SAFETY_MARGIN
-    candidates = []
-
-    for ev in EV_CATALOG:
-        range_ok = ev["range_km"] >= required_range
-        payload_ok = ev["payload_kg"] >= avg_payload_kg
-        charge_ok = dwell_time_hours >= ev["charge_time_hours"]
-        feasible = range_ok and payload_ok and charge_ok
-
-        # margin-based confidence: how comfortably it clears each gate, not just pass/fail
-        range_margin = min(1.5, ev["range_km"] / required_range) / 1.5 if required_range > 0 else 1.0
-        payload_margin = min(1.5, ev["payload_kg"] / max(avg_payload_kg, 1)) / 1.5
-        charge_margin = min(1.5, dwell_time_hours / ev["charge_time_hours"]) / 1.5 if ev["charge_time_hours"] > 0 else 1.0
-        confidence = round(float(100 * np.mean([range_margin, payload_margin, charge_margin])), 1) if feasible else 0.0
-
-        candidates.append({**ev, "feasible": feasible, "confidence_pct": confidence,
-                            "range_ok": range_ok, "payload_ok": payload_ok, "charge_ok": charge_ok})
-
-    feasible_options = [c for c in candidates if c["feasible"]]
-    if feasible_options:
-        best = min(feasible_options, key=lambda c: c["price_inr_lakh"])  # cheapest that actually fits
-        return {
-            "readiness": "ready", "recommended_model": best["model"],
-            "confidence_pct": best["confidence_pct"], "price_inr_lakh": best["price_inr_lakh"],
-            "reason": f"Fits within {best['model']}'s {best['range_km']}km range, "
-                      f"{best['payload_kg']}kg payload, and {best['charge_time_hours']}h charge window.",
-            "all_options": candidates,
-        }
-    else:
-        blockers = []
-        best_attempt = max(candidates, key=lambda c: c["confidence_pct"] if c["feasible"] else
-                            np.mean([c["range_ok"], c["payload_ok"], c["charge_ok"]]))
-        if not best_attempt["range_ok"]:
-            blockers.append(f"no catalog option covers the required {required_range:.0f}km range")
-        if not best_attempt["payload_ok"]:
-            blockers.append(f"payload of {avg_payload_kg:.0f}kg exceeds all current EV options")
-        if not best_attempt["charge_ok"]:
-            blockers.append(f"only {dwell_time_hours:.1f}h dwell time isn't enough to recharge")
-        return {
-            "readiness": "not_yet_viable", "recommended_model": None, "confidence_pct": 0.0,
-            "price_inr_lakh": None, "reason": "; ".join(blockers), "all_options": candidates,
-        }
 
 
 def generate_fleet(n=60) -> pd.DataFrame:
@@ -90,11 +45,18 @@ def generate_fleet(n=60) -> pd.DataFrame:
         else:  # Highway feeder
             dist, payload, dwell = RNG.uniform(100, 220), RNG.uniform(500, 900), RNG.uniform(2, 6)
 
+        # Score the values that get WRITTEN, not the raw draws. Scoring
+        # `dist` while publishing `round(dist, 1)` made the CSV's own
+        # confidence_pct unreproducible from its own input columns on 8 of 60
+        # rows (ICE-001 82.1 published vs 82.3 recomputed, ICE-047 78.4 vs
+        # 78.6). The dashboard shows the inputs and the confidence side by side,
+        # so a reader can and does check that arithmetic.
+        dist, payload, dwell = round(dist, 1), round(payload, 0), round(dwell, 1)
         result = score_vehicle(dist, payload, dwell)
         rows.append({
             "vehicle_id": f"ICE-{i+1:03d}", "route_type": route,
-            "daily_distance_km": round(dist, 1), "avg_payload_kg": round(payload, 0),
-            "dwell_time_hours": round(dwell, 1), "readiness": result["readiness"],
+            "daily_distance_km": dist, "avg_payload_kg": payload,
+            "dwell_time_hours": dwell, "readiness": result["readiness"],
             "recommended_model": result["recommended_model"],
             "confidence_pct": result["confidence_pct"], "price_inr_lakh": result["price_inr_lakh"],
             "reason": result["reason"],

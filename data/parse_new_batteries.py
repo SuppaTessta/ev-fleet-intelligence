@@ -9,6 +9,7 @@ Usage: python data/parse_new_batteries.py
 """
 
 from pathlib import Path
+
 from parse_mat_battery import parse_mat_to_discharge_csv
 
 RAW_DIR = Path(__file__).resolve().parent / "raw" / "nasa_battery"

@@ -1,0 +1,37 @@
+# Lint config. Deliberately not maximalist -- a rule set nobody can satisfy gets
+# disabled wholesale, which is worse than a smaller one that stays green.
+line-length = 110
+target-version = "py312"
+
+exclude = ["venv", ".venv", "__pycache__", "notebooks", "demo"]
+
+[lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes -- unused imports/names, the ones that catch real bugs
+    "I",    # import sorting
+    "B",    # bugbear -- mutable defaults, unused loop vars, except-pass
+    "UP",   # pyupgrade
+    "C4",   # comprehension simplifications
+]
+ignore = [
+    "E501",  # line length: enforced by the formatter, not worth failing a build over
+    "B008",  # function call in default arg -- this is how FastAPI's Depends/File work
+]
+
+[lint.per-file-ignores]
+# Training and analysis scripts legitimately do work at module scope and import
+# matplotlib before setting a backend.
+#
+# E702/E731/F841 are relaxed for train/ specifically because of matplotlib
+# idiom: paired axis calls read better on one line
+# (`ax.set_xlabel(...); ax.set_ylabel(...)`), `norm = lambda x, y: ...` is the
+# conventional tf.data map function, and `im = ax.imshow(...)` keeps the handle
+# available while iterating on a figure. These are style choices inside
+# plotting code, not defects. They are NOT relaxed for backend/ or dashboard/,
+# where the same patterns would be worth flagging.
+"train/*" = ["E402", "E702", "E731", "F841", "B905"]
+"data/*" = ["E402", "E702", "B905"]
+"evaluation/*" = ["E702"]
+"tests/*" = ["E402", "B011"]  # skip_if_missing() must precede the agent import
+"backend/app/agents/quality_agent.py" = ["E402"]  # matplotlib.use("Agg") first

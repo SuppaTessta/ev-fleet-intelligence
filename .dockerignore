@@ -1,0 +1,21 @@
+# Keeps the build context small and stops local state leaking into images.
+venv/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.git/
+.github/
+
+# Raw datasets: hundreds of MB, and reproducible via data/ scripts.
+data/raw/
+
+# Model artifacts are bind-mounted by docker-compose, not baked in.
+backend/models/
+
+docs/
+tests/
+*.md
+Makefile
+make.ps1

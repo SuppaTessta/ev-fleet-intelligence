@@ -1,0 +1,45 @@
+# Two services, because the API and the dashboard fail independently: a missing
+# model artifact should degrade the API to 503 on some routes while the
+# dashboard stays up and says so.
+#
+#   docker compose up --build        # http://localhost:8501
+#
+# Model artifacts are NOT baked into the image -- they are gitignored, up to
+# 98 MB each, and rebuilt from train/. They are bind-mounted instead, so the
+# image stays reproducible and the artifacts stay yours.
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ev-fleet-intelligence-api:latest
+    ports:
+      - "8000:8000"
+    volumes:
+      # read-only: the service only ever loads these
+      - ./backend/models:/app/backend/models:ro
+      - ./data/processed:/app/data/processed:ro
+    environment:
+      TF_CPP_MIN_LOG_LEVEL: "2"
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    image: ev-fleet-intelligence-dashboard:latest
+    ports:
+      - "8501:8501"
+    environment:
+      # 127.0.0.1 inside a container is the container itself; `api` is the
+      # compose service name and resolves on the shared network.
+      EV_FLEET_API_URL: "http://api:8000"
+    volumes:
+      - ./data/processed:/app/data/processed:ro
+    depends_on:
+      api:
+        # wait for the healthcheck, not just for the process to exist --
+        # TensorFlow import alone takes several seconds
+        condition: service_healthy
+    restart: unless-stopped

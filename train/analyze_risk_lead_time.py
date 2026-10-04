@@ -22,10 +22,11 @@ Outputs
 """
 
 from pathlib import Path
-import numpy as np
-import pandas as pd
+
 import joblib
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 
 MODEL_DIR = Path(__file__).resolve().parents[1] / "backend" / "models"
 DOCS_DIR = Path(__file__).resolve().parents[1] / "docs"
@@ -118,13 +119,18 @@ def analyze():
         lead_shipments = hard_failure_point - first_watch
         print(f"\nWATCH-level lead time: {lead_shipments} shipments "
               f"(~{lead_shipments * DAYS_BETWEEN_SHIPMENTS} days) before it's audit-obvious")
-    print("\nHonest takeaway: the binary 'flagged' threshold is tuned for precision on sudden "
-          "spikes (price, audit, concentration — all ~100% recall) and is conservative on gradual "
-          "drift by design (~25% recall on this archetype in the full evaluation). The continuous "
-          "risk score still rises well before the hard-failure line even when the binary flag "
-          "doesn't fire — so a WATCH-level threshold on the score, not just the flag, is what "
-          "actually delivers lead time on slow drift. Worth stating as a specific, honest finding "
-          "in the submission rather than a blanket 'we detect risk early' claim.")
+    # Read the recall out of the artifact rather than restating it. This block
+    # carried a fourth hardcoded copy of the table -- and, like the dashboard
+    # caption and risk_agent.py's docstring, it had gone stale at
+    # concentration_geopolitical 0.385 (5/13) against the shipped data's 0.462
+    # (6/13). Three copies were corrected and this one was missed, which is the
+    # argument for not having copies.
+    print("\nHonest takeaway: the binary 'flagged' threshold catches two of the five archetypes "
+          "reliably and the other three poorly. Measured per-archetype recall on the shipped "
+          f"dataset: {_archetype_recall_line()}. The continuous risk score still rises well "
+          "before the hard-failure line even when the binary flag doesn't fire — so a WATCH-level "
+          "threshold on the score, not just the flag, is what actually delivers lead time on "
+          "slow drift.")
 
     fig, ax = plt.subplots(figsize=(9, 5))
     ax2 = ax.twinx()
@@ -144,6 +150,25 @@ def analyze():
     plt.close(fig)
     print(f"\nSaved plot to {DOCS_DIR / 'risk_lead_time_analysis.png'}")
     return df
+
+
+def _archetype_recall_line() -> str:
+    """Per-archetype recall, from the model artifact -- never restated by hand.
+
+    train_risk_model.py computes it on the shipped dataset and stores it in
+    risk_model.pkl; /risk/metadata serves the same values to the dashboard.
+    """
+    import joblib
+
+    artifact = Path(__file__).resolve().parents[1] / "backend" / "models" / "risk_model.pkl"
+    if not artifact.is_file():
+        return "unavailable (run train/train_risk_model.py to regenerate the artifact)"
+    recall = joblib.load(artifact).get("metrics", {}).get("archetype_recall_shipped_dataset")
+    if not recall:
+        return ("unavailable (this risk_model.pkl predates the persisted archetype recall -- "
+                "re-run train/train_risk_model.py)")
+    return ", ".join(f"{name} {e['recall']:.3f} ({int(e['recall'] * e['n'] + 0.5)}/{e['n']})"
+                     for name, e in sorted(recall.items(), key=lambda kv: -kv[1]["recall"]))
 
 
 if __name__ == "__main__":

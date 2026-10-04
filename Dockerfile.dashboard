@@ -1,0 +1,26 @@
+# Streamlit UI. Separate image from the API: they scale, restart and fail
+# independently, and the dashboard needs none of TensorFlow.
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /app
+
+# Dependencies first so editing a page does not reinstall them, and versioned in
+# a file rather than inline arguments so they live in one place.
+COPY dashboard/requirements.txt ./dashboard/requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r dashboard/requirements.txt
+
+COPY dashboard/ ./dashboard/
+COPY data/processed/ ./data/processed/
+
+RUN useradd --create-home --uid 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 8501
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health',timeout=4).status==200 else 1)"
+
+CMD ["streamlit", "run", "dashboard/main.py", \
+     "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true"]

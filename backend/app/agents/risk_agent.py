@@ -1,27 +1,40 @@
-"""
-EV Supply Chain Risk & Traceability Agent.
+"""EV Supply Chain Risk & Traceability: anomaly detection over shipment records.
 
-Wraps the trained Isolation Forest. Given a shipment's features, returns
-a risk score, a healthy/watch/critical band, and which named risk pattern
-it most resembles, so the caller gets an actionable reason, not just a
-number.
+Wraps the trained Isolation Forest. Returns a risk score, a
+healthy/watch/critical band, and the named risk pattern the shipment most
+resembles, so the caller gets an actionable reason rather than a bare number.
 
-risk_band uses two thresholds, not one binary flag — this is a direct,
-operationalized result of the lead-time analysis (see
-train/analyze_risk_lead_time.py): the "critical" threshold is tuned for
-precision on sudden spikes (~100% recall there), but gradual drift shows
-up as a rising score well before it clears that bar. WATCH surfaces that
-early signal instead of waiting for CRITICAL, which is where the real
-lead-time advantage comes from on slow-drift cases.
+The band uses two thresholds rather than the model's single binary flag. That
+flag catches sudden spikes reliably and gradual drift poorly, so WATCH surfaces
+the early signal from the continuous score instead of waiting for the flag --
+see train/analyze_risk_lead_time.py.
+
+Per-archetype recall of the binary flag, measured on the shipped 1,000-shipment
+dataset (79 injected anomalies):
+
+    price_spike_late_delivery    1.000  (14/14)
+    stale_audit_volume_spike     1.000  (17/17)
+    quality_drift                0.933  (14/15)
+    concentration_geopolitical   0.462  (6/13)
+    gradual_quality_decline      0.350  (7/20)
+
+Two of five archetypes are caught reliably; the other three are not, which is
+why the WATCH band exists.
+
+The table above is a convenience copy. The authoritative values are computed by
+train_risk_model.py, stored in the artifact, and served at GET /risk/metadata --
+which is what the dashboard reads, so a stale comment here cannot reach a user.
 """
 
 from pathlib import Path
+
+import joblib
 import numpy as np
 import pandas as pd
-import joblib
 
-MODEL_PATH = Path(__file__).resolve().parents[2] / "models" / "risk_model.pkl"
-DATA_PATH = Path(__file__).resolve().parents[3] / "data" / "processed" / "supply_chain_shipments.csv"
+from app import config
+
+MODEL_PATH = config.RISK_MODEL
 
 
 class RiskAgent:
@@ -32,13 +45,18 @@ class RiskAgent:
         self.feature_cols = artifact["feature_cols"]
         self.score_min = artifact["raw_score_min"]
         self.score_max = artifact["raw_score_max"]
-        # WATCH threshold = top 25% of the full training score distribution —
-        # see train/analyze_risk_lead_time.py for why this, not just the flag
-        try:
-            all_shipments = pd.read_csv(DATA_PATH)
-            self.watch_threshold = float(all_shipments["risk_score"].quantile(0.75))
-        except FileNotFoundError:
-            self.watch_threshold = 0.3  # fallback if run before training data exists
+        self.metrics = artifact.get("metrics", {})
+
+        # The WATCH boundary lives in the artifact, not in this file and not in
+        # a CSV read at startup. A decision boundary is part of the model: if it
+        # can be recomputed from whatever data happens to be on the machine, the
+        # same artifact serves different risk bands on different hosts.
+        if "watch_threshold" not in artifact:
+            raise KeyError(
+                "risk_model.pkl predates the persisted watch_threshold. "
+                "Re-run train/train_risk_model.py -- refusing to guess a "
+                "decision boundary that determines who gets paged.")
+        self.watch_threshold = float(artifact["watch_threshold"])
 
     def _explain(self, f: dict) -> str:
         """Simple rule-based reason matching the injected archetypes —

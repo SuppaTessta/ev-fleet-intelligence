@@ -1,39 +1,33 @@
-"""
-EV Supply Chain Risk & Traceability Agent — training pipeline.
+"""Supply Chain Risk training pipeline.
 
-No public dataset fits "EV battery supply chain fraud" — so this one is
-synthetic, same as the honest tradeoff flagged from the start. What makes
-it a legitimate demo rather than noise: the generator is grounded in real,
-well-documented supply-chain facts (China's dominance in cell/rare-earth
-processing, DRC's dominance and ESG risk in cobalt, Australia/Chile as
-lower-risk lithium sources), and anomalies are injected as 5 named,
-realistic risk archetypes rather than random noise — so evaluation means
-something (precision/recall against known-injected anomalies), matching
-the same Isolation Forest technique as Fintech-Fraud-Detection.
+No public dataset fits "EV battery supply chain fraud", so this one is
+synthetic. What makes it a legitimate demo rather than noise: the generator is
+grounded in documented supply-chain facts (China's dominance in cell and
+rare-earth processing, DRC's dominance and ESG risk in cobalt, Australia and
+Chile as lower-risk lithium sources), and anomalies are injected as five named
+archetypes so evaluation means something -- precision and recall against known
+injected anomalies.
 
-Archetype #5 (gradual_quality_decline) exists because of a real finding:
-testing "detection lead time" against the first 4 archetypes showed the
-model was actually LATE on a slow quality drift — it only ever saw sudden
-spikes in training, never a gradual ramp through moderate values. Trend
-features (rate of change vs. this supplier's own recent shipments) plus
-gradual-decline training examples close that gap. See
-train/analyze_risk_lead_time.py for the before/after.
+Archetype 5 (gradual_quality_decline) exists because of a real finding: testing
+detection lead time against the first four showed the model was LATE on slow
+quality drift, having only ever seen sudden spikes. Trend features plus
+gradual-decline training examples close that gap; see
+train/analyze_risk_lead_time.py.
 
-Outputs
--------
-- data/processed/supply_chain_shipments.csv
-- backend/models/risk_model.pkl
-- docs/risk_model_eval.png
+Outputs: data/processed/supply_chain_shipments.csv,
+backend/models/risk_model.pkl, docs/risk_model_eval.png.
 """
 
-import numpy as np
-import pandas as pd
 from pathlib import Path
+
 import joblib
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 from sklearn.ensemble import IsolationForest
+from sklearn.metrics import average_precision_score, precision_recall_fscore_support, roc_auc_score
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import precision_recall_fscore_support
 
 PROC_DIR = Path(__file__).resolve().parents[1] / "data" / "processed"
 MODEL_DIR = Path(__file__).resolve().parents[1] / "backend" / "models"
@@ -42,7 +36,14 @@ for d in (PROC_DIR, MODEL_DIR, DOCS_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 RNG = np.random.default_rng(42)
-CONTAMINATION = 0.09  # slightly higher now that 5 archetypes are injected instead of 4
+# Isolation Forest's `contamination` IS the decision threshold -- it sets the
+# quantile above which a point is called anomalous. Setting it from the true
+# prevalence would be label leakage. It is kept at a round 0.09 as a DEPLOYMENT
+# choice (a team tolerating ~9% of shipments flagged for review), and the
+# headline metric is AUC-PR, which is threshold-free.
+CONTAMINATION = 0.09
+TEST_SIZE = 0.30
+N_SPLITS = 20  # repeated stratified splits; one split on ~24 positives is noise
 
 # material -> (region, geopolitical_risk 0-1, baseline unit price, price volatility)
 MATERIALS = {
@@ -84,7 +85,8 @@ def generate_suppliers():
         # baseline market share split across this material's suppliers (Dirichlet
         # gives a realistic mix: some dominant suppliers, some minor ones)
         shares = RNG.dirichlet(np.ones(N_SUPPLIERS_PER_MATERIAL) * 1.3)
-        single_sourced = N_SUPPLIERS_PER_MATERIAL == 1 or shares.max() > 0.6
+        # single-sourcing is decided per supplier below (share > 0.6). A
+        # material-level variable was computed here and never read.
         for i, share in enumerate(shares):
             suppliers.append({
                 "supplier_id": f"{MATERIAL_ABBREV[material]}-SUP{i+1}",
@@ -179,30 +181,112 @@ def generate_shipments(suppliers: pd.DataFrame) -> pd.DataFrame:
 
 
 def train_and_evaluate(df: pd.DataFrame):
-    scaler = StandardScaler()
-    X = scaler.fit_transform(df[FEATURE_COLS])
+    """Fit on a training split, report on a held-out one.
 
+    Isolation Forest is unsupervised, so the split is not about preventing label
+    memorisation -- it never sees labels. It is about the METRIC: a score
+    distribution fitted to a sample and evaluated on that same sample flatters
+    itself, and the min/max used to normalise risk_score are themselves fitted
+    quantities.
+
+    AUC-PR is the headline because it needs no threshold. Precision, recall and
+    F1 at the deployment threshold are reported alongside, clearly labelled as
+    threshold-dependent.
+    """
+    # One held-out split is not enough: 30% of 79 anomalies is ~24 positives, and
+    # metrics on 24 positives swing wildly with the seed. Repeat and report the
+    # spread.
+    aucs, precs, recs, f1s = [], [], [], []
+    for seed in range(N_SPLITS):
+        tr, te = train_test_split(df, test_size=TEST_SIZE,
+                                   stratify=df.is_anomaly, random_state=seed)
+        sc = StandardScaler().fit(tr[FEATURE_COLS])
+        m = IsolationForest(n_estimators=300, contamination=CONTAMINATION,
+                            random_state=seed).fit(sc.transform(tr[FEATURE_COLS]))
+        tr_raw = m.score_samples(sc.transform(tr[FEATURE_COLS]))
+        lo, hi = float(tr_raw.min()), float(tr_raw.max())
+        te_x = sc.transform(te[FEATURE_COLS])
+        te_risk = np.clip(1 - (m.score_samples(te_x) - lo) / (hi - lo), 0, 1)
+        te_flag = (m.predict(te_x) == -1).astype(int)
+        aucs.append(average_precision_score(te.is_anomaly, te_risk))
+        pp, rr, ff, _ = precision_recall_fscore_support(
+            te.is_anomaly, te_flag, average="binary", zero_division=0)
+        precs.append(pp); recs.append(rr); f1s.append(ff)
+
+    print(f"\n--- HELD-OUT over {N_SPLITS} stratified {int((1-TEST_SIZE)*100)}/"
+          f"{int(TEST_SIZE*100)} splits (mean +/- sd) ---")
+    print(f"  AUC-PR    {np.mean(aucs):.3f} +/- {np.std(aucs):.3f}   "
+          f"(prevalence baseline {df.is_anomaly.mean():.3f})")
+    print(f"  precision {np.mean(precs):.2f} +/- {np.std(precs):.2f}   "
+          f"recall {np.mean(recs):.2f} +/- {np.std(recs):.2f}   "
+          f"F1 {np.mean(f1s):.2f} +/- {np.std(f1s):.2f}")
+    print(f"  AUC-PR range across splits: {min(aucs):.3f} to {max(aucs):.3f} "
+          f"-- the spread is why one split is not a result")
+
+    train_df, test_df = train_test_split(
+        df, test_size=TEST_SIZE, stratify=df.is_anomaly, random_state=42)
+    print(f"\nreference split for the shipped artifact: {len(train_df)} train / "
+          f"{len(test_df)} held out ({int(test_df.is_anomaly.sum())} true anomalies)")
+
+    scaler = StandardScaler().fit(train_df[FEATURE_COLS])
     model = IsolationForest(n_estimators=300, contamination=CONTAMINATION, random_state=42)
-    model.fit(X)
-    raw_scores = model.score_samples(X)  # higher = more normal
-    df["risk_score"] = 1 - (raw_scores - raw_scores.min()) / (raw_scores.max() - raw_scores.min())
-    df["flagged"] = (model.predict(X) == -1).astype(int)
+    model.fit(scaler.transform(train_df[FEATURE_COLS]))
 
-    precision, recall, f1, _ = precision_recall_fscore_support(
-        df.is_anomaly, df.flagged, average="binary", zero_division=0)
-    print(f"Precision: {precision:.2f}  Recall: {recall:.2f}  F1: {f1:.2f}")
-    print(f"\nFlagged {df.flagged.sum()} of {len(df)} shipments "
-          f"({df.flagged.sum()/len(df)*100:.1f}%) as anomalous.")
-    print("\nOf flagged shipments, by true anomaly type:")
-    print(df[df.flagged == 1].anomaly_type.value_counts())
+    # normalisation bounds come from TRAIN only -- using the full set would let
+    # test-set extremes define the scale the test set is then scored against
+    train_raw = model.score_samples(scaler.transform(train_df[FEATURE_COLS]))
+    score_min, score_max = float(train_raw.min()), float(train_raw.max())
 
-    # ---- eval plot: risk score distribution, normal vs true-anomalous ----
+    def score(frame):
+        x = scaler.transform(frame[FEATURE_COLS])
+        raw = model.score_samples(x)
+        risk = np.clip(1 - (raw - score_min) / (score_max - score_min), 0, 1)
+        return risk, (model.predict(x) == -1).astype(int)
+
+    test_risk, test_flag = score(test_df)
+    p, r, f1, _ = precision_recall_fscore_support(
+        test_df.is_anomaly, test_flag, average="binary", zero_division=0)
+    auc_pr = average_precision_score(test_df.is_anomaly, test_risk)
+    auc_roc = roc_auc_score(test_df.is_anomaly, test_risk)
+    baseline = test_df.is_anomaly.mean()
+
+    print("\n--- HELD-OUT performance (the honest numbers) ---")
+    print(f"  AUC-PR   {auc_pr:.3f}   (random baseline = prevalence = {baseline:.3f}, "
+          f"so {auc_pr / baseline:.1f}x better than chance)")
+    print(f"  AUC-ROC  {auc_roc:.3f}")
+    print(f"  at the {CONTAMINATION:.0%} deployment threshold: "
+          f"precision {p:.2f} | recall {r:.2f} | F1 {f1:.2f}")
+
+    in_risk, in_flag = score(train_df)
+    ip, ir, if1, _ = precision_recall_fscore_support(
+        train_df.is_anomaly, in_flag, average="binary", zero_division=0)
+    print(f"  (in-sample, for comparison: precision {ip:.2f} | recall {ir:.2f} | F1 {if1:.2f}, "
+          f"AUC-PR {average_precision_score(train_df.is_anomaly, in_risk):.3f})")
+
+    # per-archetype recall on the held-out split
+    print("\n  held-out recall by archetype:")
+    scored_test = test_df.assign(flagged=test_flag)
+    for archetype, sub in scored_test[scored_test.is_anomaly == 1].groupby("anomaly_type"):
+        print(f"    {archetype:28s} n={len(sub):3d}  recall={sub.flagged.mean():.3f}")
+
+    # score the FULL frame for the persisted CSV the dashboard reads
+    all_risk, all_flag = score(df)
+    df = df.assign(risk_score=all_risk, flagged=all_flag)
+
+    # WATCH threshold, computed here and persisted into the artifact so the
+    # decision boundary travels with the model rather than being recomputed
+    # from whatever data happens to be on the serving host.
+    watch_threshold = float(np.quantile(all_risk, 0.75))
+    print(f"\n  WATCH threshold (75th pct of the scored shipment set): {watch_threshold:.4f}")
+
     fig, axes = plt.subplots(1, 2, figsize=(11, 4))
     axes[0].hist(df[df.is_anomaly == 0].risk_score, bins=30, alpha=0.6, label="Normal", color="#00A676")
     axes[0].hist(df[df.is_anomaly == 1].risk_score, bins=30, alpha=0.6, label="Injected anomaly", color="#E5484D")
-    axes[0].axvline(df[df.flagged == 1].risk_score.min(), color="black", linestyle="--", label="Flagging threshold")
+    axes[0].axvline(watch_threshold, color="#F2A93B", linestyle="--", label="WATCH threshold")
+    axes[0].axvline(df[df.flagged == 1].risk_score.min(), color="black", linestyle="--", label="CRITICAL flag")
     axes[0].set_xlabel("Risk score"); axes[0].set_ylabel("Count")
-    axes[0].set_title("Risk score separation"); axes[0].legend(fontsize=8)
+    axes[0].set_title(f"Risk score separation (held-out AUC-PR {auc_pr:.3f})")
+    axes[0].legend(fontsize=8)
 
     conc = df.groupby("material")["supplier_concentration_pct"].max().sort_values()
     axes[1].barh(conc.index, conc.values, color="#1A2E2A")
@@ -212,7 +296,32 @@ def train_and_evaluate(df: pd.DataFrame):
     fig.savefig(DOCS_DIR / "risk_model_eval.png", dpi=150)
     plt.close(fig)
 
-    return model, scaler, df, float(raw_scores.min()), float(raw_scores.max())
+    # Per-archetype recall on the SHIPPED dataset -- the basis risk_agent.py and
+    # the dashboard caption both name. Persisted so the number the UI shows is
+    # read from the same artifact that produced it, the way watch_threshold is.
+    scored_all = df.assign(flagged=all_flag)
+    archetype_recall = {
+        str(name): {"n": int(len(sub)), "recall": round(float(sub.flagged.mean()), 3)}
+        for name, sub in scored_all[scored_all.is_anomaly == 1].groupby("anomaly_type")
+    }
+    print()
+    print("  per-archetype recall on the full shipped dataset (what the UI reports):")
+    for name, e in sorted(archetype_recall.items(), key=lambda kv: -kv[1]["recall"]):
+        print(f"    {name:28s} n={e['n']:3d}  recall={e['recall']:.3f}")
+
+    metrics = {
+        # headline: mean over N_SPLITS repeated splits, with the spread
+        "auc_pr_mean": float(np.mean(aucs)), "auc_pr_sd": float(np.std(aucs)),
+        # per-archetype recall on the shipped dataset, so the UI never hardcodes it
+        "archetype_recall_shipped_dataset": archetype_recall,
+        "precision_mean": float(np.mean(precs)), "recall_mean": float(np.mean(recs)),
+        "f1_mean": float(np.mean(f1s)), "n_splits": N_SPLITS,
+        # the single reference split the shipped artifact was fitted on
+        "auc_pr_reference_split": float(auc_pr), "auc_roc_reference_split": float(auc_roc),
+        "prevalence": float(baseline), "n_train": len(train_df), "n_test": len(test_df),
+        "contamination_threshold": CONTAMINATION,
+    }
+    return model, scaler, df, score_min, score_max, watch_threshold, metrics
 
 
 if __name__ == "__main__":
@@ -226,10 +335,15 @@ if __name__ == "__main__":
     df.to_csv(PROC_DIR / "supply_chain_shipments.csv", index=False)
 
     print("Training Isolation Forest...")
-    model, scaler, df_scored, score_min, score_max = train_and_evaluate(df)
+    model, scaler, df_scored, score_min, score_max, watch_threshold, metrics = \
+        train_and_evaluate(df)
 
+    # watch_threshold travels WITH the model. Recomputing a decision boundary at
+    # startup from a gitignored CSV meant the artifact alone did not determine
+    # the model's behaviour.
     joblib.dump({"model": model, "scaler": scaler, "feature_cols": FEATURE_COLS,
-                 "raw_score_min": score_min, "raw_score_max": score_max},
+                 "raw_score_min": score_min, "raw_score_max": score_max,
+                 "watch_threshold": watch_threshold, "metrics": metrics},
                 MODEL_DIR / "risk_model.pkl")
     df_scored.to_csv(PROC_DIR / "supply_chain_shipments.csv", index=False)
     print(f"\nSaved model to {MODEL_DIR / 'risk_model.pkl'}")

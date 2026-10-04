@@ -8,7 +8,7 @@ file at all, so their tests always run. Every other endpoint eventually
 calls an agent that does need one -- those tests skip cleanly if it's
 missing, same as the corresponding agent-level test file.
 """
-from conftest import skip_if_missing, MODELS_DIR, DATA_PROCESSED_DIR
+from conftest import DATA_PROCESSED_DIR, MODELS_DIR, skip_if_missing
 
 # ---------------------------------------------------------------- always run
 
@@ -23,9 +23,19 @@ def test_carbon_compute_savings(client):
     assert "savings_pct" in resp.json()
 
 
-def test_carbon_unknown_vehicle_is_a_400_not_a_500(client):
+def test_carbon_unknown_vehicle_is_a_422_not_a_500(client):
+    """422, not the 400 this asserted previously.
+
+    The request is well-formed and matches the schema; it just names a vehicle
+    with no energy profile. That is a semantic validation failure, which is what
+    422 means and what every other validation failure in this API returns. The
+    old 400 came from a blanket `except ValueError` in the router; it is now
+    routed through DomainValidationError so the body carries a request_id and
+    no exception string.
+    """
     resp = client.post("/carbon/compute-savings", json={"vehicle_model": "Not A Real EV", "daily_distance_km": 60.0})
-    assert resp.status_code == 400
+    assert resp.status_code == 422
+    assert "request_id" in resp.json()
 
 
 def test_fleet_readiness_score(client):
@@ -59,7 +69,7 @@ def test_battery_predict_rul(client):
     skip_if_missing(MODELS_DIR / "battery_rul_model.pkl")
     resp = client.post("/battery/predict-rul", json={
         "asset_id": "TEST-BATTERY", "capacity_history_ah": [1.856, 1.846, 1.835, 1.826, 1.811, 1.799, 1.786],
-        "temp_battery_c": 25.0, "discharge_time_s": 3000.0, "ambient_temp_c": 24.0,
+        "temp_battery_c": 25.0, "ambient_temp_c": 24.0,
         "discharge_current_a": 2.0, "pack_kwh": 21.3,
     })
     assert resp.status_code == 200
@@ -89,3 +99,13 @@ def test_live_fleet_status(client):
     resp = client.get("/battery/live-fleet-status")
     assert resp.status_code == 200
     assert len(resp.json()["readings"]) == 8
+
+    # a GET must not advance the simulation -- it used to
+    before = client.get("/battery/live-fleet-status").json()["readings"][0]["cycle_number"]
+    after = client.get("/battery/live-fleet-status").json()["readings"][0]["cycle_number"]
+    assert before == after, "GET /live-fleet-status mutated shared simulation state"
+
+    # advancing is an explicit POST
+    ticked = client.post("/battery/live-fleet-tick")
+    assert ticked.status_code == 200
+    assert ticked.json()["readings"][0]["cycle_number"] == before + 1

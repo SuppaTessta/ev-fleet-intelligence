@@ -1,0 +1,37 @@
+MIT License
+
+Copyright (c) 2026 Sanchay Maity
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+NOTE ON DATASETS
+
+This licence covers the source code only. The datasets this project trains on
+are third-party and carry their own terms:
+
+  NASA PCoE Li-ion Battery Dataset      NASA Open Data, public domain
+  NEU Surface Defect Database           Northeastern University, research use
+  Casting product image data            Kaggle, CC BY-NC-SA 4.0 (NON-COMMERCIAL)
+  CEA CO2 Baseline Database             Central Electricity Authority, Govt. of India
+  Environment Canada fuel consumption   Open Government Licence - Canada
+
+The casting dataset is non-commercial. None of these are redistributed here;
+see SETUP.md for how to obtain each one.

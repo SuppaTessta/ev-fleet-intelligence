@@ -11,12 +11,16 @@ trainer) -- so these tests run for anyone who has the trained models, not
 just whoever still has data/raw/ populated locally.
 """
 from pathlib import Path
-from PIL import Image
 
-from conftest import skip_if_missing, MODELS_DIR
+import pytest
+from conftest import MODELS_DIR, skip_if_missing
+from PIL import Image
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 
+# Same reason as test_quality_parity.py: no wheel for this interpreter is a
+# skip, not a collection error that fails the entire suite.
+pytest.importorskip("tensorflow", reason="needs tensorflow-cpu (see SETUP.md)")
 skip_if_missing(MODELS_DIR / "quality_model.keras", MODELS_DIR / "quality_model_neu_det.keras")
 
 from app.agents.quality_agent import get_quality_agent, get_surface_quality_agent  # noqa: E402

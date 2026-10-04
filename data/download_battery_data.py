@@ -13,6 +13,7 @@ Usage: python data/download_battery_data.py
 
 import urllib.request
 from pathlib import Path
+
 from parse_mat_battery import parse_mat_to_discharge_csv
 
 CSV_BASE = "https://raw.githubusercontent.com/huzaifi18/RUL_prediction/562f109b/data/NASA"

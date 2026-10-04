@@ -1,51 +1,58 @@
+"""Battery RUL training pipeline.
+
+Predicts remaining useful life in discharge cycles from real NASA PCoE cycling
+data -- 19 cells across 5 experimental groups (room temperature to 43C to 4C,
+1A-4A discharge), not a single condition.
+
+DATA QUALITY (NASA's own group READMEs flag these)
+- Group 49-52 excluded entirely: NASA reports the run "stopped when experiment
+  control software crashed", with several runs showing implausible capacity and
+  voltage. That is a documented-unreliable run, not noise to filter.
+- Groups 45-48 and 53-56 are included, but readings below 0.3 Ah are dropped
+  first. Capacity does not physically jump 1.6 -> 0.03 -> 2.6 Ah cycle to cycle;
+  that is a measurement dropout.
+- B0052 excluded separately: only 4 usable discharge cycles.
+
+CROSS-CONDITION POOLING
+Groups have different rated capacities and different NASA stopping points, so
+end of life is defined as 70% of EACH cell's own early-life capacity rather than
+one fixed Ah number. Ambient temperature and nominal discharge current are
+explicit features so the model learns how condition affects fade instead of
+being confounded by it.
+
+VALIDATION
+Leave-one-battery-out over the 5 cells with a genuine end-of-life event -- see
+find_eol_cycle for why only 5 of 19 qualify. The original stratified hold-out
+survives as stratified_eval for comparison only: every one of its held-out cells
+is right-censored, so it scores against labels that record when NASA stopped
+rather than when the cell died.
+
+WHAT SHIPS
+The deployed artifact is trained under TRAINING_STRATEGY ("exclude", per
+ADR-0005) and with LGBM_PARAMS. Both matter, and both were once inconsistent
+with the evaluation: the final fit ran on all 19 cells while the published
+figures came from exclusion, and it carried its own inline hyperparameters that
+had lost `subsample_freq`, so bagging never ran on the shipped model.
+
+    exclude (published, and shipped)  MAE 15.9  median  3.6  R2 0.467
+    naive                             MAE 17.0  median 14.0  R2 0.769
 """
-Battery Asset Performance Management (APM) Agent — training pipeline.
 
-Predicts Remaining Useful Life (RUL), in discharge cycles, for Li-ion battery
-packs using real NASA PCoE cycling data — 19 batteries across 5 experimental
-groups (room temp to 43C to 4C, 1A-4A discharge), not just one condition.
-
-Data quality handling (this matters — NASA's own group READMEs flag issues)
-----------------------------------------------------------------------------
-- Group 49-52 (B0049-B0052) EXCLUDED entirely: NASA's own README states this
-  run "stopped when experiment control software crashed" with "several runs
-  [showing] very low capacity and voltage, reasons not fully analyzed." That's
-  not noise to filter, it's a documented-unreliable experimental run.
-- Groups 45-48 and 53-56 ARE included (NASA flags only "some" runs as bad, not
-  the whole group) but every reading below 0.3 Ah is dropped first — a sensor
-  fault floor confirmed by inspecting the raw values (capacity does not
-  physically jump from 1.6 Ah to 0.03 Ah to 2.6 Ah cycle-to-cycle; that's a
-  measurement dropout, not real degradation).
-- B0052 excluded separately for having only 4 usable discharge cycles.
-
-Cross-condition pooling
-------------------------
-- Different groups have different rated capacities and different NASA
-  stopping points (some stopped at 30% fade, others 20%) — so EOL is defined
-  as 70% of EACH BATTERY'S OWN first-cycle capacity (State-of-Health based),
-  not one fixed Ah number. This is the normalization NASA's own dataset notes
-  recommend for pooling groups.
-- Ambient temperature and nominal discharge current (from each group's
-  published test protocol) are added as explicit features, so the model
-  learns how temperature/rate affect fade rather than being confounded by it.
-
-Validation
-----------
-Stratified hold-out: one battery held out per experimental group (6 groups
--> 6 held-out batteries), trained on the remaining 13. This tests
-generalization across every condition the model will see, without the
-noise of a 19-fold leave-one-out.
-
-Model: LightGBM regressor (same tool used in Retail-Demand-Forecasting).
-"""
-
-import pandas as pd
-import numpy as np
+import sys
 from pathlib import Path
+
 import joblib
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 from lightgbm import LGBMRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+# ROLL_WINDOW is imported rather than redeclared: it is the feature window the
+# SERVING agent also uses, and a second copy here is exactly how the ddof=0/1
+# mismatch in the same pair of files went unnoticed.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
+from app.constants import ROLL_WINDOW  # noqa: E402
 
 RAW_DIR = Path(__file__).resolve().parents[1] / "data" / "raw" / "nasa_battery"
 PROC_DIR = Path(__file__).resolve().parents[1] / "data" / "processed"
@@ -68,8 +75,24 @@ HELD_OUT_PER_GROUP = ["B0007", "B0032", "B0034", "B0048", "B0056"]  # one per gr
 
 MIN_PLAUSIBLE_CAPACITY_AH = 0.3  # sensor-fault floor, see module docstring
 EOL_SOH_FRACTION = 0.70          # EOL = 70% of THIS battery's own initial capacity
+BREAK_IN_CYCLES = 5              # ignore for EOL detection -- see find_eol_cycle
+EOL_CONFIRM_CYCLES = 3           # consecutive readings needed to call EOL
+EOL_SUSTAIN_FRACTION = 0.5       # ...and this share of later readings must stay below it
 
-ROLL_WINDOW = 5
+# How the deployed artifact treats right-censored rows. "exclude" is the
+# decision recorded in docs/adr/0005-censored-rul-labels.md, and it is what
+# every published battery number is measured under.
+TRAINING_STRATEGY = "exclude"
+
+# subsample without subsample_freq is a silent no-op in LightGBM -- bagging never
+# runs, so the model was not regularised the way the code claimed.
+LGBM_PARAMS = {
+    "n_estimators": 300, "max_depth": 4, "learning_rate": 0.03,
+    "min_child_samples": 30, "num_leaves": 15,
+    "reg_alpha": 0.5, "reg_lambda": 0.5,
+    "subsample": 0.8, "subsample_freq": 1, "colsample_bytree": 0.8,
+    "random_state": 42, "verbosity": -1,
+}
 FEATURE_COLS = [
     "discharge_cycle_num", "capacity", "capacity_pct_initial",
     "roll_mean_capacity", "roll_std_capacity", "fade_rate", "cumulative_fade",
@@ -91,6 +114,44 @@ def load_battery(battery_id: str) -> pd.DataFrame:
     return df
 
 
+def find_eol_cycle(capacity: np.ndarray, cycle_num: np.ndarray, threshold: float):
+    """First cycle at which the pack is genuinely at end of life.
+
+    Returns (eol_cycle_num, censored). `censored` means the cell never reached
+    end of life inside its recorded window, so the returned cycle is where NASA
+    stopped and the RUL derived from it is a LOWER BOUND, not an observation.
+
+    Three conditions, each of which a naive `first index below threshold` misses:
+
+    1. Skip the break-in window. Several cells report an anomalously low first
+       reading -- B0034 reads 0.746 Ah at cycle 1 against 1.3-1.4 Ah for cycles
+       2-20 -- which would pin RUL to 0 for that cell's entire life.
+    2. Require EOL_CONFIRM_CYCLES consecutive readings. Capacity is noisy and one
+       sample below a threshold is not death.
+    3. Require the crossing to be SUSTAINED. B0033 crosses at cycle 138, then
+       spends 94.3% of its remaining readings back above the threshold and ends
+       at 99.5% of initial capacity. End of life is permanent; a cell that comes
+       back was never at end of life.
+
+    With all three, only 5 of 19 cells have a genuine EOL event. The other 14 are
+    right-censored. See ADR-0005.
+    """
+    below = capacity <= threshold
+    below[:BREAK_IN_CYCLES] = False   # break-in dips are not end of life
+
+    run = 0
+    for i, is_below in enumerate(below):
+        run = run + 1 if is_below else 0
+        if run < EOL_CONFIRM_CYCLES:
+            continue
+        start = i - EOL_CONFIRM_CYCLES + 1
+        # does it STAY dead? a cell that comes back was never at end of life
+        if below[start:].mean() >= EOL_SUSTAIN_FRACTION:
+            return int(cycle_num[start]), False
+        run = 0  # recovered -- keep looking for a later, permanent crossing
+    return int(cycle_num[-1]), True
+
+
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     # robust to a single anomalous first reading (found in B0034: cycle 1 read
@@ -105,10 +166,12 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df["cumulative_fade"] = initial_capacity - df["capacity"]
 
     eol_threshold_ah = initial_capacity * EOL_SOH_FRACTION  # per-battery, not fixed
-    below = df.index[df["capacity"] <= eol_threshold_ah]
-    eol_cycle_num = df.loc[below[0], "discharge_cycle_num"] if len(below) else df["discharge_cycle_num"].max()
+    eol_cycle_num, censored = find_eol_cycle(
+        df["capacity"].values, df["discharge_cycle_num"].values, eol_threshold_ah)
     df["RUL"] = (eol_cycle_num - df["discharge_cycle_num"]).clip(lower=0)
     df["eol_threshold_ah"] = eol_threshold_ah
+    df["censored"] = censored
+    df["eol_cycle_num"] = eol_cycle_num
     return df
 
 
@@ -119,14 +182,108 @@ def build_dataset() -> pd.DataFrame:
     return full
 
 
+BASELINE_WINDOW = 20   # trailing cycles used to estimate the fade slope
+
+
+def linear_fade_baseline(df: pd.DataFrame, window: int = BASELINE_WINDOW) -> np.ndarray:
+    """Physical baseline: least-squares fade slope over a trailing window,
+    extrapolated to the EOL threshold.
+
+        RUL = (capacity_now - eol_threshold) / fade_per_cycle
+
+    This exists because the RUL target is by construction a straight line of
+    slope -1, so anything tracking the fade trend should score well. Publishing a
+    learned model without showing it beats this proves nothing.
+
+    The slope is fitted by regression rather than read off the `fade_rate`
+    feature: that is a 5-cycle difference on a noisy signal, and dividing
+    headroom by a noisy near-zero denominator produces wild extrapolations,
+    which would make this a strawman rather than a real baseline.
+    """
+    cap = df["capacity"].values
+    cyc = df["discharge_cycle_num"].values.astype(float)
+    thr = df["eol_threshold_ah"].values
+    out = np.empty(len(df))
+
+    for i in range(len(df)):
+        lo = max(0, i - window + 1)
+        xs, ys = cyc[lo:i + 1], cap[lo:i + 1]
+        if len(xs) >= 3:
+            slope = np.polyfit(xs, ys, 1)[0]
+        else:
+            slope = 0.0
+        fade = -slope                                   # positive while degrading
+        out[i] = (cap[i] - thr[i]) / fade if fade > 1e-5 else 500.0
+    # Cap at roughly the longest life observed: an unbounded extrapolation off a
+    # near-flat segment is a divide-by-zero, not a prediction.
+    return np.clip(np.nan_to_num(out, nan=500.0, posinf=500.0), 0, 500)
+
+
+def leave_one_battery_out_eval(full: pd.DataFrame) -> tuple:
+    """Leave-one-battery-out CV over the cells with a genuine EOL event.
+
+    Censored cells are excluded from both training and scoring: their RUL is a
+    lower bound, and treating a lower bound as an observation is what produced
+    the original problem. TRAINING_STRATEGY applies the same rule to the
+    deployed artifact, so this evaluation describes the model that ships.
+
+    A censoring-aware alternative exists and was measured -- backend/app/
+    survival.py implements a one-sided squared hinge, and
+    evaluation/battery_censoring_study.py compares all three treatments:
+
+        strategy   median MAE   per-fold wins
+        naive          14.2          1/5
+        exclude         3.6          3/5
+        censored       13.9          1/5
+
+    Exclusion wins overall, so it stays the default. The interesting result is
+    conditional and the separation is clean: censoring-aware wins on both folds
+    where the held-out cell's condition group has only ONE other observed cell,
+    and loses on all three where it has two. A censored row says only "at least
+    this many cycles remained" -- weak evidence, worth having when there is
+    nothing better for that operating condition. Not switched on by default,
+    because deriving a switching policy from five cells would fit the noise this
+    study exists to expose.
+    """
+    genuine = sorted(full.loc[~full.censored, "battery_id"].unique())
+    data = full[full.battery_id.isin(genuine)]
+    results = {}
+
+    for held_out in genuine:
+        train_df = data[data.battery_id != held_out]
+        test_df = data[data.battery_id == held_out]
+        model = LGBMRegressor(**LGBM_PARAMS)
+        model.fit(train_df[FEATURE_COLS], train_df[TARGET_COL])
+
+        preds = np.clip(model.predict(test_df[FEATURE_COLS]), 0, None)
+        base = linear_fade_baseline(test_df)
+        y = test_df[TARGET_COL].values
+
+        results[held_out] = {
+            "group": BATTERY_META[held_out][0],
+            "n": len(test_df),
+            "mae": mean_absolute_error(y, preds),
+            "rmse": float(np.sqrt(mean_squared_error(y, preds))),
+            "r2": r2_score(y, preds) if test_df[TARGET_COL].var() > 0 else None,
+            "baseline_mae": mean_absolute_error(y, base),
+            "y_true": y, "y_pred": preds, "y_base": base,
+            "cycle": test_df["discharge_cycle_num"].values,
+        }
+        r = results[held_out]
+        r2s = f"{r['r2']:.3f}" if r["r2"] is not None else "undefined"
+        print(f"[held out {held_out} ({r['group']}, n={r['n']})] "
+              f"MAE={r['mae']:6.1f} | RMSE={r['rmse']:6.1f} | R2={r2s:>9s} "
+              f"| linear-fade baseline MAE={r['baseline_mae']:6.1f}")
+
+    return results, genuine
+
+
 def stratified_eval(full: pd.DataFrame) -> dict:
     train_df = full[~full.battery_id.isin(HELD_OUT_PER_GROUP)]
     results = {}
-    model = LGBMRegressor(n_estimators=300, max_depth=4, learning_rate=0.03,
-                           min_child_samples=30, num_leaves=15,
-                           reg_alpha=0.5, reg_lambda=0.5,
-                           subsample=0.8, colsample_bytree=0.8,
-                           random_state=42, verbosity=-1)
+    # LGBM_PARAMS, so the legacy comparison uses the same regularisation as
+    # everything it is compared against.
+    model = LGBMRegressor(**LGBM_PARAMS)
     model.fit(train_df[FEATURE_COLS], train_df[TARGET_COL])
 
     for held_out in HELD_OUT_PER_GROUP:
@@ -189,47 +346,99 @@ def plot_capacity_curves(full: pd.DataFrame):
 
 
 if __name__ == "__main__":
-    print(f"Loading {len(BATTERIES)} batteries across {len(set(v[0] for v in BATTERY_META.values()))} "
+    print(f"Loading {len(BATTERIES)} batteries across {len({v[0] for v in BATTERY_META.values()})} "
           f"condition groups (excluded: B0050, B0052, B0035, B0037, and all non-CC-protocol groups)\n")
     full = build_dataset()
     print(f"Dataset: {len(full)} cycle-level rows (after sensor-fault filtering)\n")
 
-    print("--- Stratified hold-out evaluation (one battery per condition group) ---")
-    results, model = stratified_eval(full)
-    avg_mae = np.mean([r["mae"] for r in results.values()])
-    avg_rmse = np.mean([r["rmse"] for r in results.values()])
-    defined_r2 = [r["r2"] for r in results.values() if r["r2_defined"]]
-    n_undefined = sum(1 for r in results.values() if not r["r2_defined"])
-    avg_r2 = np.mean(defined_r2)
-    print(f"\nAverage across all {len(results)} held-out batteries: MAE={avg_mae:.1f} cycles | RMSE={avg_rmse:.1f} cycles")
-    print(f"Average R2 across the {len(defined_r2)} batteries where it's actually defined: {avg_r2:.3f}")
-    if n_undefined:
-        print(f"({n_undefined} held-out batteries had zero RUL variance in their recorded window — "
-              f"already past EOL for the entire test period, so R2 isn't a meaningful metric for them; "
-              f"MAE is, and is included above.)")
+    censored_ids = sorted(full.loc[full.censored, "battery_id"].unique())
+    genuine_ids = sorted(full.loc[~full.censored, "battery_id"].unique())
+    print("--- Label audit ---")
+    print(f"  cells with a genuine EOL event : {len(genuine_ids):2d}  {genuine_ids}")
+    print(f"  right-censored (never hit EOL) : {len(censored_ids):2d}  {censored_ids}")
+    print(f"  rows: {(~full.censored).sum()} genuine / {full.censored.sum()} censored "
+          f"({100 * full.censored.mean():.1f}% censored)\n")
 
-    # Averaging per-battery R2 is known to be unstable across small, uneven
-    # groups (B0032 has only 40 recorded cycles; B0007 has 168) — pooling all
-    # held-out predictions into one R2 calculation is the more standard,
-    # defensible summary statistic, and is reported alongside, not instead of,
-    # the per-battery breakdown above (which stays because it's honest about
-    # where the model is weaker).
-    all_true = np.concatenate([r["y_true"] for r in results.values()])
-    all_pred = np.concatenate([r["y_pred"] for r in results.values()])
-    pooled_r2 = r2_score(all_true, all_pred)
-    print(f"Pooled R2 (all held-out predictions combined, the more standard summary statistic): {pooled_r2:.3f}")
+    print("--- Leave-one-battery-out CV over the genuine-EOL cells ---")
+    results, genuine = leave_one_battery_out_eval(full)
+    maes = [r["mae"] for r in results.values()]
+    base_maes = [r["baseline_mae"] for r in results.values()]
+    defined = [r["r2"] for r in results.values() if r["r2"] is not None]
+    print(f"\n  model    MAE across {len(maes)} folds: {np.mean(maes):.1f} +/- {np.std(maes):.1f} cycles")
+    print(f"  baseline MAE across {len(maes)} folds: {np.mean(base_maes):.1f} +/- {np.std(base_maes):.1f} cycles"
+          f"   (linear fade extrapolation)")
+    wins = sum(1 for r in results.values() if r["mae"] < r["baseline_mae"])
+    print(f"  model beats the baseline on {wins}/{len(results)} folds")
+    if defined:
+        print(f"  mean R2 over the {len(defined)} folds where it is defined: {np.mean(defined):.3f}")
+    all_t = np.concatenate([r["y_true"] for r in results.values()])
+    all_p = np.concatenate([r["y_pred"] for r in results.values()])
+    all_b = np.concatenate([r["y_base"] for r in results.values()])
+    print(f"  pooled R2  model={r2_score(all_t, all_p):.3f}  baseline={r2_score(all_t, all_b):.3f}")
 
-    plot_eval(results)
+    print("\n--- (legacy) original stratified hold-out, for comparison ---")
+    results_legacy, model = stratified_eval(full)
+    avg_mae = np.mean([r["mae"] for r in results_legacy.values()])
+    defined_r2 = [r["r2"] for r in results_legacy.values() if r["r2_defined"]]
+    n_undefined = sum(1 for r in results_legacy.values() if not r["r2_defined"])
+    legacy_true = np.concatenate([r["y_true"] for r in results_legacy.values()])
+    legacy_pred = np.concatenate([r["y_pred"] for r in results_legacy.values()])
+    print(f"  MAE={avg_mae:.1f} cycles | pooled R2={r2_score(legacy_true, legacy_pred):.3f}"
+          f" | R2 undefined for {n_undefined} of {len(results_legacy)} held-out cells")
+    print("  NOTE: this is the split that produced the published 0.740. Every one of its five")
+    print("  held-out cells is right-censored, so it scores predictions against labels that")
+    print("  encode when NASA stopped recording, not when the cell reached end of life.")
+
+    plot_eval(results_legacy)
     plot_capacity_curves(full)
 
-    print(f"\n--- Training final model on all {len(BATTERIES)} batteries (for deployment) ---")
-    final_model = LGBMRegressor(n_estimators=300, max_depth=4, learning_rate=0.03,
-                                 min_child_samples=30, num_leaves=15,
-                                 reg_alpha=0.5, reg_lambda=0.5,
-                                 subsample=0.8, colsample_bytree=0.8,
-                                 random_state=42, verbosity=-1)
-    final_model.fit(full[FEATURE_COLS], full[TARGET_COL])
+    # The artifact that actually gets served: trained under TRAINING_STRATEGY,
+    # on the same rows and hyperparameters the leave-one-battery-out numbers
+    # above were measured with.
+    if TRAINING_STRATEGY == "exclude":
+        deploy_df = full[~full.censored]
+    elif TRAINING_STRATEGY == "naive":
+        deploy_df = full
+    else:
+        raise SystemExit(f"unsupported TRAINING_STRATEGY {TRAINING_STRATEGY!r}; "
+                         f"expected 'exclude' or 'naive' (see ADR-0005)")
+
+    deploy_cells = sorted(deploy_df.battery_id.unique())
+    print()
+    print(f"--- Training final model, strategy={TRAINING_STRATEGY!r}: "
+          f"{len(deploy_df)} rows / {len(deploy_cells)} cells (for deployment) ---")
+    print(f"    cells: {deploy_cells}")
+
+    final_model = LGBMRegressor(**LGBM_PARAMS)
+    final_model.fit(deploy_df[FEATURE_COLS], deploy_df[TARGET_COL])
+
+    # Metrics travel with the model, for the same reason the risk agent's
+    # watch_threshold does: a published number that lives only in a README
+    # cannot be checked against the artifact a service actually loaded.
+    metrics = {
+        "protocol": "leave-one-battery-out over the cells with a genuine EOL event",
+        "training_strategy": TRAINING_STRATEGY,
+        "n_folds": len(maes),
+        "mae_mean": float(np.mean(maes)),
+        "mae_sd": float(np.std(maes)),
+        "mae_median": float(np.median(maes)),
+        "pooled_r2": float(r2_score(all_t, all_p)),
+        "per_fold_mae": {b: round(float(r["mae"]), 2) for b, r in results.items()},
+        "baseline_fade_mae_mean": float(np.mean(base_maes)),
+        "beats_baseline_folds": f"{wins}/{len(results)}",
+    }
     joblib.dump({"model": final_model, "feature_cols": FEATURE_COLS,
-                 "eol_soh_fraction": EOL_SOH_FRACTION}, MODEL_DIR / "battery_rul_model.pkl")
+                 "eol_soh_fraction": EOL_SOH_FRACTION,
+                 "training_strategy": TRAINING_STRATEGY,
+                 "trained_on_cells": deploy_cells,
+                 "n_training_rows": int(len(deploy_df)),
+                 "censored_cells_excluded": (sorted(censored_ids)
+                                             if TRAINING_STRATEGY == "exclude" else []),
+                 "metrics": metrics},
+                MODEL_DIR / "battery_rul_model.pkl")
     print(f"Saved model to {MODEL_DIR / 'battery_rul_model.pkl'}")
+    print(f"  published alongside it: MAE {metrics['mae_mean']:.1f} +/- "
+          f"{metrics['mae_sd']:.1f} (median {metrics['mae_median']:.1f}), "
+          f"pooled R2 {metrics['pooled_r2']:.3f}, beats fade baseline "
+          f"{metrics['beats_baseline_folds']}")
     print(f"Saved plots to {DOCS_DIR}")

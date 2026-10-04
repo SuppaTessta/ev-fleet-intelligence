@@ -16,8 +16,9 @@ Usage: python data/parse_mat_battery.py <path_to_BXXXX.mat> <battery_id>
 
 import sys
 from pathlib import Path
-import scipy.io as sio
+
 import pandas as pd
+import scipy.io as sio
 
 OUT_DIR = Path(__file__).resolve().parent / "raw" / "nasa_battery"
 

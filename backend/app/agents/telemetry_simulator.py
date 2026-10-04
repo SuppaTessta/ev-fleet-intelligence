@@ -1,34 +1,25 @@
+"""Live BMS telemetry simulator for the Battery APM agent.
+
+/battery/predict-rul scores a capacity history you already hold. This simulates
+what a continuous BMS integration would feed it instead.
+
+No synthetic sensor curves: each of the 8 demo trucks starts at a fixed cutoff
+and every tick advances one real NASA PCoE discharge cycle further into that
+cell's recorded history. Once a truck's history runs out it holds at the last
+real reading and sets historical_data_exhausted rather than looping or
+inventing cycles.
+
+State is module-level, one dict per process, so every polling client sees the
+same fleet -- the way a shared BMS feed behaves.
 """
-Live BMS telemetry simulator for the Battery APM agent.
-
-Addresses PS3's "IoT / Telematics / BMS Data Integration" suggested
-technology, which the batch endpoint alone doesn't cover: /battery/predict-rul
-takes a capacity history you already have in hand and returns one prediction.
-This module simulates what a live BMS integration would actually feed that
-agent continuously.
-
-This does NOT fabricate synthetic sensor curves. Each of the 8 demo trucks
-(same asset_id / battery_id / depot mapping as dashboard.build_fleet_snapshots)
-starts at its existing fixed cutoff and, on every tick, advances one real NASA
-PCoE discharge cycle further into that battery's ACTUAL recorded history --
-so "live" readings are genuine historical measurements played forward in
-simulated time, not invented values. Once a truck's real recorded history is
-exhausted, it holds at the last real reading and reports that fact explicitly
-(historical_data_exhausted: true) rather than looping or fabricating cycles
-that were never measured -- the same "don't inflate it" standard the rest of
-this codebase holds to.
-
-State lives server-side (module-level, one dict per backend process) so it
-advances consistently regardless of which dashboard client is polling --
-multiple viewers watching the live monitor see the same simulated fleet, the
-way a real shared BMS feed would work.
-"""
-from pathlib import Path
 from threading import Lock
+
 import pandas as pd
+
+from app import config
 from app.agents.battery_agent import get_battery_agent
 
-DATA_PATH = Path(__file__).resolve().parents[3] / "data" / "processed" / "battery_features.csv"
+DATA_PATH = config.BATTERY_FEATURES_CSV
 ROLL_WINDOW_HISTORY = 10  # matches dashboard.build_fleet_snapshots' window size, for a like-for-like feed
 
 # Identical fleet mapping to dashboard.build_fleet_snapshots -- this simulator
@@ -79,10 +70,22 @@ def reset_fleet():
 
 def advance_fleet_tick():
     """Advances every truck by one real historical cycle (or holds, if that
-    truck's real recorded history is exhausted) and returns fresh live
-    readings + a live RUL re-prediction for each -- using the same trained
-    BatteryAgent and the same predict() code path as the batch endpoint, not
-    a separate/simplified model."""
+    truck's real recorded history is exhausted) and returns fresh readings."""
+    return _fleet_readings(advance=True)
+
+
+def current_fleet_readings():
+    """Readings at the current position, without advancing.
+
+    Separate from advance_fleet_tick so an idempotent GET cannot consume ticks:
+    a browser prefetch or an uptime probe would otherwise mutate shared state.
+    """
+    return _fleet_readings(advance=False)
+
+
+def _fleet_readings(advance: bool):
+    """Shared body. Uses the same trained BatteryAgent and the same predict()
+    code path as the batch endpoint, not a separate/simplified model."""
     with _lock:
         if _state is None:
             _init_state_locked()
@@ -92,9 +95,13 @@ def advance_fleet_tick():
         for asset_id, s in _state.items():
             hist = df[df.battery_id == s["battery_id"]].sort_values("discharge_cycle_num")
             max_cycle = int(hist["discharge_cycle_num"].max())
-            exhausted = s["position"] >= max_cycle
-            if not exhausted:
+            # Advance first, then describe the state being returned. Deriving
+            # `exhausted` from the pre-increment position describes the state the
+            # caller no longer has, and makes this endpoint disagree with the
+            # read-only one about identical state.
+            if advance and s["position"] < max_cycle:
                 s["position"] += 1
+            exhausted = s["position"] >= max_cycle
 
             window = hist[hist.discharge_cycle_num <= s["position"]].tail(ROLL_WINDOW_HISTORY)
             latest = window.iloc[-1]
@@ -102,7 +109,6 @@ def advance_fleet_tick():
             result = agent.predict(
                 capacity_history=window["capacity"].round(3).tolist(),
                 temp_battery=float(latest["temp_battery"]),
-                time_s=float(latest["time"]),
                 ambient_temp=float(latest["ambient_temp"]),
                 discharge_current=float(latest["discharge_current"]),
                 current_cycle_number=int(s["position"]),

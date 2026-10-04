@@ -11,7 +11,7 @@ Data: NEU surface defect database ("NEU-DET"), 1800 images, 300 per class, 6 cla
 crazing, inclusion, patches, pitted_surface, rolled-in_scale, scratches. Ships as a
 flat object-detection layout (filename-encoded labels + unused XML bounding boxes);
 run data/prepare_neu_det.py first to build the train/<class>/ + test/<class>/ split
-this script expects (same layout convention as casting_defect).
+this script expects (same layout convention as casting_defect_clean).
 
 Approach
 --------
@@ -33,13 +33,20 @@ Outputs
 - docs/quality_neu_det_gradcam_samples.png  (Grad-CAM overlays on sample predictions)
 """
 
-import numpy as np
 from pathlib import Path
+
 import matplotlib.pyplot as plt
+import numpy as np
 import tensorflow as tf
+from sklearn.metrics import classification_report, confusion_matrix
 from tensorflow.keras import layers, models
 from tensorflow.keras.applications.resnet50 import ResNet50, preprocess_input
-from sklearn.metrics import confusion_matrix, classification_report
+
+SEED = 42
+# Seeds python/numpy/tensorflow together. Without this, 99.7% (359/360) was a
+# single unseeded run resting on one misclassification, and the Grad-CAM sample
+# figure drew different images every time.
+tf.keras.utils.set_random_seed(SEED)
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data" / "raw" / "neu_det"
 MODEL_DIR = Path(__file__).resolve().parents[1] / "backend" / "models"
@@ -173,17 +180,22 @@ def make_gradcam_heatmap(img_array, model, base_model, last_conv_layer_name="con
 
 def save_gradcam_samples(model, base_model, n_per_class=1):
     import random
+    random.seed(SEED)  # same samples every run, so the figure is reproducible
     test_dir = DATA_DIR / "test"
     samples = []
     for cls in CLASS_NAMES:
-        files = list((test_dir / cls).glob("*.jpg"))
+        files = sorted((test_dir / cls).glob("*.jpg"))  # glob order is filesystem-dependent
         samples.extend([(f, cls) for f in random.sample(files, min(n_per_class, len(files)))])
 
     fig, axes = plt.subplots(2, len(samples), figsize=(3.0 * len(samples), 6.4))
     for i, (fpath, true_cls) in enumerate(samples):
-        img = tf.keras.utils.load_img(fpath, target_size=IMG_SIZE)
-        arr = tf.keras.utils.img_to_array(img)
+        # tf.io.decode_image + tf.image.resize, matching image_dataset_from_directory.
+        # tf.keras.utils.load_img(target_size=...) resizes via PIL NEAREST, so the
+        # figure would be built from different pixels than the model was scored on.
+        raw = tf.io.decode_image(tf.io.read_file(str(fpath)), channels=3, expand_animations=False)
+        arr = tf.image.resize(tf.cast(raw, tf.float32), IMG_SIZE).numpy()
         arr_batch = preprocess_input(np.expand_dims(arr, 0))
+        display = np.clip(arr, 0, 255).astype("uint8")  # unclipped cast wraps -0.0001 to 255
 
         heatmap, probs, class_idx = make_gradcam_heatmap(arr_batch, model, base_model)
         pred_cls = CLASS_NAMES[class_idx]
@@ -191,11 +203,11 @@ def save_gradcam_samples(model, base_model, n_per_class=1):
 
         heatmap_resized = tf.image.resize(heatmap[..., tf.newaxis], IMG_SIZE).numpy().squeeze()
 
-        axes[0, i].imshow(arr.astype("uint8"))
+        axes[0, i].imshow(display)
         axes[0, i].set_title(f"True: {true_cls}", fontsize=9)
         axes[0, i].axis("off")
 
-        axes[1, i].imshow(arr.astype("uint8"))
+        axes[1, i].imshow(display)
         axes[1, i].imshow(heatmap_resized, cmap="jet", alpha=0.45)
         axes[1, i].set_title(f"Pred: {pred_cls} ({pred_score:.2f})", fontsize=9)
         axes[1, i].axis("off")

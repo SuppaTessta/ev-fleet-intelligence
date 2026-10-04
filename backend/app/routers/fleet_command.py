@@ -1,6 +1,7 @@
 from fastapi import APIRouter
-from app.schemas import CompoundRiskRequest, CompoundRiskResponse
+
 from app.agents.compound_risk_agent import compute_compound_risk
+from app.schemas import CompoundRiskRequest, CompoundRiskResponse
 
 router = APIRouter(prefix="/fleet", tags=["Compound Risk Agent"])
 

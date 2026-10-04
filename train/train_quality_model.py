@@ -26,15 +26,26 @@ Outputs
 - docs/quality_gradcam_samples.png  (Grad-CAM overlays on sample predictions)
 """
 
-import numpy as np
 from pathlib import Path
+
 import matplotlib.pyplot as plt
+import numpy as np
 import tensorflow as tf
+from sklearn.metrics import classification_report, confusion_matrix
 from tensorflow.keras import layers, models
 from tensorflow.keras.applications.resnet50 import ResNet50, preprocess_input
-from sklearn.metrics import confusion_matrix, classification_report
 
-DATA_DIR = Path(__file__).resolve().parents[1] / "data" / "raw" / "casting_defect"
+SEED = 42
+# Seeds python/numpy/tensorflow together. Without this the reported accuracy was
+# a single unseeded run that nobody -- including its author -- could reproduce,
+# and the Grad-CAM sample figure picked different images every time.
+tf.keras.utils.set_random_seed(SEED)
+
+# Defaults to the leakage-free part-level split from data/prepare_casting.py.
+# The vendor's own casting_data split shares 97.5% of its test PARTS with train
+# (it was made after augmentation), and a model trained on it scores 99.44% there
+# but collapses to 88.08% on genuinely unseen castings. See data/prepare_casting.py.
+DATA_DIR = Path(__file__).resolve().parents[1] / "data" / "raw" / "casting_defect_clean"
 MODEL_DIR = Path(__file__).resolve().parents[1] / "backend" / "models"
 DOCS_DIR = Path(__file__).resolve().parents[1] / "docs"
 for d in (MODEL_DIR, DOCS_DIR):
@@ -43,6 +54,7 @@ for d in (MODEL_DIR, DOCS_DIR):
 IMG_SIZE = (128, 128)
 BATCH_SIZE = 32
 EPOCHS = 6
+TAG = ""  # set from --tag; suffixes the output figures
 CLASS_NAMES = ["def_front", "ok_front"]  # alphabetical = Keras default label order
 
 
@@ -108,7 +120,7 @@ def evaluate(model, test_ds):
             ax.text(j, i, cm[i, j], ha="center", va="center",
                      color="white" if cm[i, j] > cm.max() / 2 else "black")
     fig.tight_layout()
-    fig.savefig(DOCS_DIR / "quality_model_eval.png", dpi=150)
+    fig.savefig(DOCS_DIR / f"quality_model_eval{TAG}.png", dpi=150)
     plt.close(fig)
     return report
 
@@ -130,7 +142,15 @@ def make_gradcam_heatmap(img_array, model, base_model, last_conv_layer_name="con
         conv_out, base_out = grad_model(img_array)
         tape.watch(conv_out)
         preds = head_model(base_out)
-        loss = preds[:, 0]
+        # The single output neuron is sigmoid P(ok_front) (CLASS_NAMES is
+        # alphabetical, so index 0 is def_front and index 1 is ok_front).
+        # Explaining preds[:, 0] unconditionally -- as this did -- means that on
+        # a DEFECTIVE prediction the heatmap answers "why is this part OK?",
+        # and since Grad-CAM then ReLU-clips negative contributions the result
+        # collapses to noise on the background. Measured against the corrected
+        # map on a real defective casting: correlation -0.39. Explain the class
+        # actually predicted.
+        loss = preds[:, 0] if float(preds[0, 0]) > 0.5 else -preds[:, 0]
 
     grads = tape.gradient(loss, conv_out)
     pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
@@ -143,39 +163,64 @@ def make_gradcam_heatmap(img_array, model, base_model, last_conv_layer_name="con
 
 def save_gradcam_samples(model, base_model, n=4):
     import random
+    random.seed(SEED)  # same four samples every run, so the figure is reproducible
     test_dir = DATA_DIR / "test"
     samples = []
     for cls in CLASS_NAMES:
-        files = list((test_dir / cls).glob("*.jpeg"))
+        files = sorted((test_dir / cls).glob("*.jpeg"))  # sorted: glob order is filesystem-dependent
         samples.extend([(f, cls) for f in random.sample(files, min(n // 2, len(files)))])
 
     fig, axes = plt.subplots(2, len(samples), figsize=(3.2 * len(samples), 6.4))
     for i, (fpath, true_cls) in enumerate(samples):
-        img = tf.keras.utils.load_img(fpath, target_size=IMG_SIZE)
-        arr = tf.keras.utils.img_to_array(img)
+        # tf.io.decode_image + tf.image.resize, matching what
+        # image_dataset_from_directory feeds the model during training.
+        # tf.keras.utils.load_img(target_size=...) -- used here previously --
+        # resizes through PIL with NEAREST interpolation by default, so the
+        # figure was generated from different pixels than the model was
+        # evaluated on. Same class of bug as the serving path had.
+        raw = tf.io.decode_image(tf.io.read_file(str(fpath)), channels=3, expand_animations=False)
+        arr = tf.image.resize(tf.cast(raw, tf.float32), IMG_SIZE).numpy()
         arr_batch = preprocess_input(np.expand_dims(arr, 0))
+        # clip before the uint8 cast: resize can land a hair below 0, and an
+        # unclipped cast wraps -0.0001 round to 255, speckling dark regions
+        # with bright pixels
+        display = np.clip(arr, 0, 255).astype("uint8")
 
         heatmap, pred_score = make_gradcam_heatmap(arr_batch, model, base_model)
         pred_cls = CLASS_NAMES[1] if pred_score > 0.5 else CLASS_NAMES[0]
 
         heatmap_resized = tf.image.resize(heatmap[..., tf.newaxis], IMG_SIZE).numpy().squeeze()
 
-        axes[0, i].imshow(arr.astype("uint8"))
+        axes[0, i].imshow(display)
         axes[0, i].set_title(f"True: {true_cls}", fontsize=9)
         axes[0, i].axis("off")
 
-        axes[1, i].imshow(arr.astype("uint8"))
+        axes[1, i].imshow(display)
         axes[1, i].imshow(heatmap_resized, cmap="jet", alpha=0.45)
         axes[1, i].set_title(f"Pred: {pred_cls} ({pred_score:.2f})", fontsize=9)
         axes[1, i].axis("off")
 
     fig.suptitle("Grad-CAM — what the model is looking at")
     fig.tight_layout()
-    fig.savefig(DOCS_DIR / "quality_gradcam_samples.png", dpi=150)
+    fig.savefig(DOCS_DIR / f"quality_gradcam_samples{TAG}.png", dpi=150)
     plt.close(fig)
 
 
 if __name__ == "__main__":
+    import argparse
+    _ap = argparse.ArgumentParser(description=__doc__)
+    _ap.add_argument("--data-dir", type=Path, default=DATA_DIR,
+                     help="dataset root containing train/ and test/. Use "
+                          "data/raw/casting_defect_clean for the leakage-free "
+                          "part-level split built by data/prepare_casting.py; the "
+                          "vendor's default split shares 97.5%% of its test parts "
+                          "with train.")
+    _ap.add_argument("--model-out", type=Path, default=MODEL_DIR / "quality_model.keras")
+    _ap.add_argument("--tag", default="", help="suffix for output figure filenames")
+    _args = _ap.parse_args()
+    DATA_DIR = _args.data_dir
+    TAG = _args.tag
+
     print(f"Loading casting defect dataset from {DATA_DIR} ...")
     train_ds, val_ds, test_ds = load_datasets()
 
@@ -192,7 +237,7 @@ if __name__ == "__main__":
     print("\n--- Generating Grad-CAM samples ---")
     save_gradcam_samples(model, base_model)
 
-    model.save(MODEL_DIR / "quality_model.keras")
+    model.save(_args.model_out)
     print(f"\nSaved model to {MODEL_DIR / 'quality_model.keras'}")
     print(f"Saved plots to {DOCS_DIR}")
     print(f"\nFinal test accuracy: {report['accuracy']:.1%}")

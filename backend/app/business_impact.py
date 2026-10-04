@@ -1,31 +1,27 @@
-"""
-Business Impact translation layer.
+"""Business-impact translation.
 
-Every agent so far speaks in its own technical units — RUL cycles, risk
-scores, confidence percentages. None of that means anything to a business
-stakeholder until it's translated into money and downtime, which is what
-"Business Impact" (25% of judging, same weight as Innovation) actually
-asks for.
+The agents speak in RUL cycles, risk scores and confidence percentages. A fleet
+manager cannot act on "RUL = 42 cycles"; they can act on "replace this pack
+within three weeks or risk a roadside failure costing 1.5x the planned swap".
 
-Grounding for the numbers below (not invented):
-- Battery replacement cost: Rs 15,000-25,000/kWh for Indian commercial EVs
-  in 2026, consistent across multiple independent sources (OEM service
-  data, EV industry press). Midpoint of Rs 18,000/kWh used.
-- Local delivery trucking rates: Rs 10-25/km for mini/light commercial
-  trucks (0.5-2 ton) on local routes, 2025-26 Indian logistics pricing.
-  Midpoint of Rs 15/km used for revenue-at-risk estimates.
-- Unplanned-vs-planned repair cost multiplier: industry fleet-maintenance
-  sources consistently report unplanned repairs costing meaningfully more
-  than scheduled ones (emergency labour rates, expedited parts, towing).
-  A conservative 1.5x multiplier is used here rather than the more
-  aggressive 2-3x some sources cite, specifically to avoid overstating
-  the case.
+Every function returns its assumptions alongside the number, so a reader can
+disagree with the inputs rather than having to trust the output.
 
-Every function below returns its assumptions alongside the number, so
-nothing here is presented as more certain than it is.
+Sourcing:
+- Battery replacement Rs 15,000-25,000/kWh for Indian commercial EVs in 2026,
+  consistent across OEM service data and industry press. Midpoint used.
+- Local delivery trucking Rs 10-25/km for mini/light commercial trucks on local
+  routes, 2025-26 Indian logistics pricing. Midpoint used.
+- Unplanned repairs cost more than scheduled ones (emergency labour, expedited
+  parts, towing). 1.5x is used rather than the 2-3x some sources cite, to avoid
+  overstating the case.
 """
 
-BATTERY_COST_PER_KWH_INR = 18000  # midpoint of Rs 15,000-25,000/kWh, Indian commercial EV, 2026
+from app.constants import BATTERY_COST_INR_PER_KWH
+
+# re-exported under the old name so call sites and the assumption strings
+# below read unchanged; the single definition lives in app.constants
+BATTERY_COST_PER_KWH_INR = BATTERY_COST_INR_PER_KWH
 UNPLANNED_REPAIR_MULTIPLIER = 1.5  # conservative vs. industry-cited 2-3x
 DEFAULT_TRUCK_RATE_PER_KM_INR = 15  # midpoint of Rs 10-25/km, mini/light commercial trucks, local routes
 

@@ -1,15 +1,42 @@
-fastapi>=0.115
-uvicorn>=0.34
-pydantic>=2.9
-lightgbm>=4.5
-scikit-learn>=1.5
-pandas>=2.2
-numpy>=1.26
-joblib>=1.4
-matplotlib>=3.9
-tensorflow-cpu>=2.17
-pillow>=10.4
-python-multipart>=0.0.12
-streamlit>=1.38
-requests>=2.32
-pulp>=2.8
+# Runtime dependencies.
+#
+# Every entry carries an upper bound. Without one, `pip install -r` resolves
+# differently every month and the published numbers stop being reproducible --
+# which is the one property this project is built around. The bounds are the
+# compatibility envelope. requirements.lock records the exact set the API image
+# was built and verified against; regenerate it with `make lock`.
+#
+# pulp is the concrete case: 4.0 removes both `LpVariable(name, ...)` direct
+# construction and `PULP_CBC_CMD`, and the maintenance agent uses both. An
+# unbounded `pulp>=2.8` would have picked that up silently on the next clean
+# install and broken scheduling outright.
+
+fastapi>=0.115,<1.0
+uvicorn>=0.34,<1.0
+pydantic>=2.9,<3.0
+# Never imported directly. FastAPI needs it to parse multipart/form-data,
+# which is how /quality/inspect receives an UploadFile -- without it those
+# routes fail at request time, not import time.
+python-multipart>=0.0.12,<0.1
+
+lightgbm>=4.5,<5.0
+scikit-learn>=1.5,<2.0
+pandas>=2.2,<4.0
+numpy>=1.26,<3.0
+joblib>=1.4,<2.0
+
+# Vision agent only. No wheel exists for Python 3.13+ or arm64 Linux; the
+# service starts without it and reports `quality` degraded at /ready.
+tensorflow-cpu>=2.17,<3.0
+pillow>=10.4,<14.0
+matplotlib>=3.9,<4.0
+
+pulp>=2.8,<4.0
+
+# Floor is the oldest release this was actually run against, not the oldest
+# that might work: the layout argument is `width="stretch"`, and the
+# `use_container_width` it replaces was already past its stated removal date
+# (2025-12-31). Pinning below this would ship a kwarg we never exercised.
+streamlit>=1.62,<2.0
+altair>=5.0,<7.0
+requests>=2.32,<3.0

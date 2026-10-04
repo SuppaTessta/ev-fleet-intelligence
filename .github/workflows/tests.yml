@@ -24,12 +24,41 @@ jobs:
           pip install -r backend/requirements.txt
           pip install -r backend/requirements-dev.txt
 
+      - name: Lint
+        run: ruff check backend dashboard train data evaluation tests tools
+
+      # Two training pipelines are fully self-contained -- they synthesise their
+      # own data and finish in seconds -- so CI builds them rather than skipping
+      # every test that depends on them. This is what makes the badge mean
+      # something: previously ~18 of 47 tests ran and no model code executed at
+      # all, while the job still spent minutes installing tensorflow-cpu.
+      - name: Build reproducible model artifacts
+        run: |
+          python train/train_risk_model.py
+          python train/train_fleet_readiness.py
+
+      - name: Verify no train/test leakage in any committed image split
+        run: |
+          checked=0
+          for split in data/raw/casting_defect_clean data/raw/neu_det; do
+            if [ -d "$split" ]; then
+              python evaluation/leakage_check.py "$split" --max-exact 0
+              checked=1
+            fi
+          done
+          if [ "$checked" = "0" ]; then
+            echo "no local image splits in CI -- checked locally via 'make leakage-check'"
+          fi
+
       - name: Run tests
         run: pytest tests/ -v
-        # Trained models and processed data are gitignored by design (see
-        # backend/models/*.keras|*.pkl and data/raw|processed in .gitignore)
-        # -- reproducible locally via train/*.py, not committed. The tests
-        # that need them auto-skip here with a clear reason (see
-        # tests/conftest.py) rather than failing; this workflow is
-        # intentionally checking the pure-logic agents plus every endpoint's
-        # request validation and error handling on every push.
+        # Still skipped here: the two ResNet50 classifiers, 98 MB each, which are
+        # too large to commit and too slow to retrain per-run. Their
+        # PREPROCESSING is covered by tests/test_quality_parity.py, which needs
+        # no weights and does run. Everything else -- battery, risk, compound
+        # risk, telemetry, carbon, readiness, maintenance, and the whole
+        # operational surface -- executes for real.
+
+      - name: Report what actually ran
+        if: always()
+        run: pytest tests/ -q --no-header -rs 2>&1 | tail -25
